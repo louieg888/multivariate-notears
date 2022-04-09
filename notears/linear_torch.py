@@ -9,9 +9,8 @@ from scipy.special import expit as sigmoid
 
 def data_schema():
     return {
-        "embedding": 10,
-        "test": 5,
-        "intensity": 10
+        "embedding": 4,
+        "intensity": 4,
     }
 
 
@@ -72,30 +71,30 @@ def notears_linear(X, lambda1, loss_type, max_iter=100, h_tol=1e-8, rho_max=1e+1
     def _loss(W):
         """Evaluate value and gradient of loss."""
         # M = X @ W
-        # M = torch.matmul(X, W)
-        M = torch.matmul(X, W * mask(data_schema()))
+        M = torch.matmul(X, W)
+        # M = torch.matmul(X, W * mask(data_schema()))
         if loss_type == 'l2':
             R = X - M
-            loss = 0.5 / X.size[0] * (R ** 2).sum()
-            G_loss = - 1.0 / X.size[0] * torch.matmul(X.t(), R)
+            loss = 0.5 / X.shape[0] * (R ** 2).sum()
+            G_loss = - 1.0 / X.shape[0] * torch.matmul(X.t(), R)
         elif loss_type == 'logistic':
-            loss = 1.0 / X.size[0] * (np.logaddexp(0, M) - X * M).sum()
-            G_loss = 1.0 / X.size[0] * torch.matmul(X.t(), (torch.sigmoid(M) - X))
+            loss = 1.0 / X.shape[0] * (np.logaddexp(0, M) - X * M).sum()
+            G_loss = 1.0 / X.shape[0] * torch.matmul(X.t(), (torch.sigmoid(M) - X))
         elif loss_type == 'poisson':
             S = torch.exp(M)
-            loss = 1.0 / X.size[0] * (S - X * M).sum()
-            G_loss = 1.0 / X.size[0] * torch.matmul(X.t(), (S - X))
+            loss = 1.0 / X.shape[0] * (S - X * M).sum()
+            G_loss = 1.0 / X.shape[0] * torch.matmul(X.t(), (S - X))
         else:
             raise ValueError('unknown loss type')
         return loss, G_loss
 
     def _h(W):
         """Evaluate value and gradient of acyclicity constraint."""
-        fW = f(W)
+        fW = f(W * W)
         fd = fW.shape[0]
         # E = slin.expm(W * W)  # (Zheng et al. 2018)
         fE = torch.matrix_exp(fW * fW)
-        E = torch.matrix_exp(W * W * mask(data_schema()))
+        E = torch.matrix_exp(W * W)
         h = torch.trace(fE) - fd
         # h = np.trace(E) - d
         #     # A different formulation, slightly faster at the cost of numerical stability
@@ -107,7 +106,7 @@ def notears_linear(X, lambda1, loss_type, max_iter=100, h_tol=1e-8, rho_max=1e+1
 
     def _adj(w):
         """Convert doubled variables ([2 d^2] array) back to original variables ([d, d] matrix)."""
-        return (w[:d * d] - w[d * d:]).reshape([d, d])
+        return torch.tensor((w[:d * d] - w[d * d:]).reshape([d, d]))
 
     def _func(w):
         """Evaluate value and gradient of augmented Lagrangian for doubled variables ([2 d^2] array)."""
@@ -121,7 +120,15 @@ def notears_linear(X, lambda1, loss_type, max_iter=100, h_tol=1e-8, rho_max=1e+1
 
     n, d = X.shape
     w_est, rho, alpha, h = torch.zeros(2 * d * d), 1.0, 0.0, torch.inf  # double w_est into (w_pos, w_neg)
-    bnds = [(0, 0) if i == j else (0, None) for _ in range(2) for i in range(d) for j in range(d)]
+
+    def non_shitty_contains(i, j):
+        for tup in torch.nonzero(1 - mask(data_schema())):
+            if torch.all(torch.eq(torch.tensor([i, j]), tup)):
+                return True
+
+        return False
+
+    bnds = [(0, 0) if non_shitty_contains(i,j) else (0, None) for _ in range(2) for i in range(d) for j in range(d)]
     if loss_type == 'l2':
         X = X - torch.mean(X, axis=0, keepdims=True)
     for _ in range(max_iter):
@@ -138,6 +145,7 @@ def notears_linear(X, lambda1, loss_type, max_iter=100, h_tol=1e-8, rho_max=1e+1
         alpha += rho * h
         if h <= h_tol or rho >= rho_max:
             break
+
     W_est = _adj(w_est)
     W_est[torch.abs(W_est) < w_threshold] = 0
     return W_est
@@ -148,8 +156,11 @@ if __name__ == '__main__':
     from notears import utils
     utils.set_random_seed(1)
 
-    n, d, s0, graph_type, sem_type = 100, 25, 20, 'ER', 'gauss'
+    n, d, s0, graph_type, sem_type = 100, 8, 20, 'ER', 'gauss'
     B_true = utils.simulate_dag(d, s0, graph_type)
+    B_true = B_true * mask(data_schema()).numpy()
+    B_true[:4,4:8] = 0
+
     W_true = utils.simulate_parameter(B_true)
     np.savetxt('W_true.csv', W_true, delimiter=',')
 

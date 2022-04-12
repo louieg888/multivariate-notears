@@ -7,6 +7,14 @@ from scipy.linalg import block_diag
 from scipy.special import expit as sigmoid
 
 
+def non_shitty_contains(i, j):
+    for tup in torch.nonzero(1 - mask(data_schema())):
+        if torch.all(torch.eq(torch.tensor([i, j]), tup)):
+            return True
+
+    return False
+
+
 def data_schema():
     return {
         "embedding": 4,
@@ -19,6 +27,29 @@ def mask(schema):
     f_mask = block_diag(*block_matrices)
     return torch.tensor(1 - f_mask)
 
+def get_w_est_len(schema):
+    total_size = sum(list(schema.values()))**2
+    block_diag_size = sum([dim**2 for dim in list(schema.values())])
+    return total_size - block_diag_size
+
+def reconstruct_W(w, schema):
+    d = sum(list(schema.values()))
+    W = torch.zeros(d, d, dtype=torch.float64)
+    nonzero_locations = torch.nonzero(mask(schema))
+    for ind, tup in enumerate([tuple(val) for val in nonzero_locations]):
+        W[tup] = w[ind]
+
+    return W
+
+
+def reconstruct_w(W, schema):
+    d = sum(list(schema.values()))**2
+    w = torch.zeros(get_w_est_len(schema))
+    nonzero_locations = torch.nonzero(mask(schema))
+    for ind, tup in enumerate([tuple(val) for val in nonzero_locations]):
+        w[ind] = W[tup]
+
+    return w
 
 def f(W):
     dims = torch.tensor(list(data_schema().values()))
@@ -46,7 +77,7 @@ def f(W):
         return s
 
     flattened_index_grid = index_grid.reshape((np.prod(index_grid.size()) // 2, 2))
-    f_W_entries = torch.tensor([get_sum(entry) for entry in flattened_index_grid])
+    f_W_entries = torch.stack([get_sum(entry) for entry in flattened_index_grid])
     f_W = f_W_entries.reshape(index_grid.size()[:2])
 
     f_W = (1 - torch.eye(f_W.shape[0])) * f_W
@@ -86,11 +117,13 @@ def notears_linear(X, lambda1, loss_type, max_iter=100, h_tol=1e-8, rho_max=1e+1
             G_loss = 1.0 / X.shape[0] * torch.matmul(X.t(), (S - X))
         else:
             raise ValueError('unknown loss type')
-        return loss, G_loss
+        # return loss, G_loss
+        return loss
 
     def _h(W):
         """Evaluate value and gradient of acyclicity constraint."""
-        fW = f(W * W)
+        #fW = f(torch.abs(W))
+        fW = f(W*W)
         fd = fW.shape[0]
         # E = slin.expm(W * W)  # (Zheng et al. 2018)
         fE = torch.matrix_exp(fW * fW)
@@ -102,46 +135,60 @@ def notears_linear(X, lambda1, loss_type, max_iter=100, h_tol=1e-8, rho_max=1e+1
         #     E = np.linalg.matrix_power(M, d - 1)
         #     h = (E.T * M).sum() - d
         G_h = E.T * W * 2 * mask(data_schema())
-        return h, G_h
+        # return h, G_h
+        return h
+
 
     def _adj(w):
         """Convert doubled variables ([2 d^2] array) back to original variables ([d, d] matrix)."""
-        return torch.tensor((w[:d * d] - w[d * d:]).reshape([d, d]))
+        return reconstruct_W(w, schema=data_schema())
+        # return torch.tensor((w[:d * d] - w[d * d:]).reshape([d, d]))
 
     def _func(w):
         """Evaluate value and gradient of augmented Lagrangian for doubled variables ([2 d^2] array)."""
         W = _adj(w)
-        loss, G_loss = _loss(W)
-        h, G_h = _h(W)
-        obj = loss + 0.5 * rho * h * h + alpha * h + lambda1 * w.sum()
-        G_smooth = G_loss + (rho * h + alpha) * G_h
-        g_obj = np.concatenate((G_smooth + lambda1, - G_smooth + lambda1), axis=None)
-        return obj, g_obj
+        #loss, G_loss = _loss(W)
+        loss = _loss(W)
+        #h, G_h = _h(W)
+        h = _h(W)
+        obj = loss + 0.5 * rho * h * h + alpha * h + lambda1 * torch.abs(w).sum()
+        # G_smooth = G_loss + (rho * h + alpha) * G_h
+        # g_obj = np.concatenate((G_smooth + lambda1, - G_smooth + lambda1), axis=None)
+        #return obj, g_obj
+        return obj
+
 
     n, d = X.shape
-    w_est, rho, alpha, h = torch.zeros(2 * d * d), 1.0, 0.0, torch.inf  # double w_est into (w_pos, w_neg)
+    # w_est, rho, alpha, h = torch.zeros(2 * d * d), 1.0, 0.0, torch.inf  # double w_est into (w_pos, w_neg)
+    w_est, rho, alpha, h = torch.zeros(get_w_est_len(schema=data_schema())), 1.0, 0.0, torch.inf  # double w_est into (w_pos, w_neg)
+    w_est.requires_grad = True
+    optimizer = torch.optim.LBFGS([w_est],
+                            history_size=100,
+                            max_iter=4,
+                            line_search_fn="strong_wolfe")
+    h_lbfgs = []
 
-    def non_shitty_contains(i, j):
-        for tup in torch.nonzero(1 - mask(data_schema())):
-            if torch.all(torch.eq(torch.tensor([i, j]), tup)):
-                return True
 
-        return False
-
-    bnds = [(0, 0) if non_shitty_contains(i,j) else (0, None) for _ in range(2) for i in range(d) for j in range(d)]
+    # bnds = [(0, 0) if non_shitty_contains(i,j) else (0, None) for _ in range(2) for i in range(d) for j in range(d)]
     if loss_type == 'l2':
         X = X - torch.mean(X, axis=0, keepdims=True)
     for _ in range(max_iter):
         w_new, h_new = None, None
         while rho < rho_max:
-            sol = sopt.minimize(_func, w_est, method='L-BFGS-B', jac=True, bounds=bnds)
-            w_new = sol.x
-            h_new, _ = _h(_adj(w_new))
+            optimizer.zero_grad()
+            objective = _func(w_est)
+            objective.backward(retain_graph=True)
+            optimizer.step(lambda: _func(w_est))
+            h_lbfgs.append(objective.item())
+
+            # sol = sopt.minimize(_func, w_est.detach(), method='L-BFGS-B', jac=True)
+            #w_new = sol.x
+            h_new = _h(_adj(w_est))
             if h_new > 0.25 * h:
                 rho *= 10
             else:
                 break
-        w_est, h = w_new, h_new
+        h = h_new
         alpha += rho * h
         if h <= h_tol or rho >= rho_max:
             break

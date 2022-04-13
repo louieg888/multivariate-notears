@@ -68,13 +68,13 @@ class Decoder(nn.Module):
         return x
 
 
-enc = Encoder(4)
-dec = Decoder(4)
-# summary(enc, input_size=(1, 28, 28))
-# enc(torch.ones(2,1,28,28))
+# enc = Encoder(4)
+# dec = Decoder(4)
+# # summary(enc, input_size=(1, 28, 28))
+# # enc(torch.ones(2,1,28,28))
 
 
-class CausalConvolutionalAE(nn.Module):
+class ConvolutionalAE(nn.Module):
     def __init__(self, graph, schema, embedding_dim=4):
         self.encoder = Encoder(embedding_dim)
         self.decoder = Decoder(embedding_dim)
@@ -103,6 +103,114 @@ class CausalConvolutionalAE(nn.Module):
         return X
 
 
+class CausalConvolutionalAE(nn.Module):
+    def __init__(self, graph, schema, embedding_dim=4):
+        self.encoder = Encoder(embedding_dim)
+        self.decoder = Decoder(embedding_dim)
+        self.embedding_dim = embedding_dim
+
+    @staticmethod
+    def infer_data_schema(obs_dict):
+        return OrderedDict(
+            (node_name, obs_value.shape[1]) for node_name, obs_value in obs_dict.items()
+        )
+
+    def forward(self, obs_dict, images):
+        im_embs = self.encoder(images)
+        pred_ims = self.decoder(im_embs)
+
+        X = im_embs
+        for node_name, node_obs in obs_dict.items():
+            X = torch.cat([X, torch.Tensor(node_obs)], axis=1)
+
+        return X
+
+
+# batch wise no tears
+# no tears helper
+# Loss should only return a number
+
+# class AELoss:
+# DAGsimilaryLoss
+
+
+class NoTearsLoss(nn.Module):
+    def __init__(self, schema, max_iter=100, h_tol=1e-8, rho_max=1e16, w_threshold=0.3):
+        self.schema = schema
+        self.mask = self._mask()
+        self.w_est_len = self._get_w_est_len()
+        self.d = self.mask.shape[0]
+
+    def _mask(self):
+        """
+        Mask the block diagonal for an expanded W matrix with zeros, removes the possibility for self loops
+        """
+        block_matrices = [np.ones((dim, dim)) for dim in list(self.schema.values())]
+        f_mask = block_diag(*block_matrices)
+        return torch.tensor(1 - f_mask)
+
+    def _get_w_est_len(self):
+        """
+        Number of non-zero variable entries in W after masking the block diagonal
+        """
+        return sum(self.mask)
+
+    @functools.lru_cache(maxsize=100, typed=False)
+    def reconstruct_W(w):
+        """
+        Expand w to block matrix W
+        """
+        W = torch.zeros(self.d, self.d, dtype=torch.float64)
+        nonzero_locations = self.w_est_len
+        for ind, tup in enumerate([tuple(val) for val in nonzero_locations]):
+            W[tup] = w[ind]
+        return W
+
+    @functools.lru_cache(maxsize=100, typed=False)
+    def f(W):
+        """
+        In every block of the expanded W matrix, sum the entries and returns a
+        new W with the aggregated flows
+        """
+        dims = torch.tensor(list(self.schema.values()))  # list of node dimensions
+        dims_cumsum = torch.cumsum(dims, dim=0)
+
+        def get_grid(lst):
+            grid_xs, grid_ys = torch.meshgrid(lst, lst)
+            original_shape = grid_ys.size()
+            locations = torch.tensor(
+                [(x, y) for x, y in zip((grid_xs.flatten()), grid_ys.flatten())]
+            )
+            locations = locations.reshape((*original_shape, 2))
+            return locations
+
+        locations_grid = get_grid(dims_cumsum)
+        dimensions_grid = get_grid(dims)
+        index_grid = get_grid(torch.tensor(range(len(dims))))
+
+        def get_sum(index):
+            location = locations_grid[tuple(index)]
+            dimension = dimensions_grid[tuple(index)]
+
+            loc_x, loc_y = location
+            dim_x, dim_y = dimension
+
+            s = torch.sum(W[loc_x - dim_x : loc_x, loc_y - dim_y : loc_y])
+            return s
+
+        flattened_index_grid = index_grid.reshape((np.prod(index_grid.size()) // 2, 2))
+        f_W_entries = torch.stack([get_sum(entry) for entry in flattened_index_grid])
+        f_W = f_W_entries.reshape(index_grid.size()[:2])
+
+        f_W = (1 - torch.eye(f_W.shape[0])) * f_W
+
+        return f_W
+
+    def forward(self, X, W_true):
+        # X –> w_est, W_true
+        return X
+
+
 def non_shitty_contains(i, j):
     for tup in torch.nonzero(1 - mask(data_schema())):
         if torch.all(torch.eq(torch.tensor([i, j]), tup)):
@@ -111,11 +219,11 @@ def non_shitty_contains(i, j):
     return False
 
 
-def data_schema():
-    return {
-        "embedding": 4,
-        "intensity": 4,
-    }
+# def data_schema():
+#     return {
+#         "embedding": 4,
+#         "intensity": 4,
+#     }
 
 
 def mask(schema):
@@ -150,8 +258,8 @@ def reconstruct_w(W, schema):
     return w
 
 
-def f(W):
-    dims = torch.tensor(list(data_schema().values()))
+def f(W, schema):
+    dims = torch.tensor(list(schema.values()))
     dims_cumsum = torch.cumsum(dims, dim=0)
 
     def get_grid(lst):
